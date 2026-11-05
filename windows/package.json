@@ -1,0 +1,67 @@
+{
+  "name": "interview-assistant",
+  "productName": "Interview Assistant",
+  "version": "1.2.0",
+  "description": "Запись собеседований с автоматической расшифровкой",
+  "author": "Ivan Tregubov",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/unit.test.js test/coach.test.js test/live.test.js",
+    "dist": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "38.8.0",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "local.ivan.interviewassistant",
+    "productName": "Interview Assistant",
+    "copyright": "Interview Assistant",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "lib/**",
+      "ui/**",
+      "assets/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/whisper",
+        "to": "whisper"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "artifactName": "InterviewAssistant-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Interview Assistant",
+      "language": "1049",
+      "installerLanguages": [
+        "ru_RU"
+      ],
+      "deleteAppDataOnUninstall": false
+    },
+    "publish": null
+  }
+}
