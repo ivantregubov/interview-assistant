@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { buildDialogue, markdown, json, timestamp } = require('../lib/transcript');
-const { WavWriter, repairWav } = require('../lib/wav');
+const { WavWriter, repairWav, analyzeWav, writeBoostedWav } = require('../lib/wav');
 const { parseSegments, isSpeech } = require('../lib/whisper');
 
 const seg = (start, end, speaker, text) => ({ start, end, speaker, text });
@@ -40,6 +40,41 @@ test('WAV пишется и восстанавливается после сбо
   assert.strictEqual(fs.readFileSync(crash).readUInt32LE(40), 0);
   repairWav(crash);
   assert.strictEqual(fs.readFileSync(crash).readUInt32LE(40), 100);
+});
+
+test('анализ дорожки отличает тишину от звука', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ir-'));
+  const quiet = path.join(dir, 'q.wav');
+  let w = new WavWriter(quiet); w.append(new Uint8Array(32000)); w.close();
+  assert.deepStrictEqual(analyzeWav(quiet), { seconds: 1, peak: 0 });
+  const loud = path.join(dir, 'l.wav');
+  w = new WavWriter(loud); w.append(new Uint8Array(new Int16Array([0, 16384, -3000]).buffer)); w.close();
+  assert.strictEqual(analyzeWav(loud).peak, 0.5);
+  assert.ok(markdown([], 't', ['Ваш голос: в записи нет звука']).includes('- Ваш голос: в записи нет звука'));
+});
+
+test('усиленная копия не меняет исходную запись', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ir-'));
+  const src = path.join(dir, 's.wav'); const dst = path.join(dir, 'd.wav');
+  const w = new WavWriter(src); w.append(new Uint8Array(new Int16Array([100, -200, 30000]).buffer)); w.close();
+  writeBoostedWav(src, dst, 10);
+  const out = fs.readFileSync(dst);
+  assert.strictEqual(out.readInt16LE(44), 1000);
+  assert.strictEqual(out.readInt16LE(46), -2000);
+  assert.strictEqual(out.readInt16LE(48), 32767, 'без переполнения');
+  assert.strictEqual(fs.readFileSync(src).readInt16LE(44), 100);
+  assert.strictEqual(out.readUInt32LE(40), 6);
+});
+
+test('длинные повторы символа убираются из расшифровки', () => {
+  const out = parseSegments(JSON.stringify({ transcription: [{ offsets: { from: 0, to: 1000 }, text: ` Кэ${'э'.repeat(150)} текст` }] }), 'me');
+  assert.strictEqual(out[0].text, 'Кэ текст');
+});
+
+test('ложные фразы Whisper не считаются речью', () => {
+  assert.strictEqual(isSpeech('Субтитры сделал DimaTorzok'), false);
+  assert.strictEqual(isSpeech('Продолжение следует...'), false);
+  assert.strictEqual(isSpeech('Субтитры можно включить в настройках'), true);
 });
 
 test('разбор ответа Whisper отбрасывает служебные пометки', () => {

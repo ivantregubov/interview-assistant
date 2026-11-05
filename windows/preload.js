@@ -22,8 +22,8 @@ contextBridge.exposeInMainWorld('appBridge', {
   decodeResult: (id, error, samples) => ipcRenderer.send('decode:result', id, error, samples),
 });
 
-ipcRenderer.on('coach:speech', (_event, track, text) => {
-  window.postMessage({ coach: 'speech', track, text }, '*');
+ipcRenderer.on('coach:speech', (_event, track, text, elapsedMs) => {
+  window.postMessage({ coach: 'speech', track, text, elapsedMs }, '*');
 });
 ipcRenderer.on('coach:llmDelta', (_event, id, text) => {
   window.postMessage({ coach: 'delta', id, text }, '*');

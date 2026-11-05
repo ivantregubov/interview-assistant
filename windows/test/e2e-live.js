@@ -7,13 +7,16 @@ const fakeLlm = require('./fake-llm');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ir-live-'));
   const userData = path.join(root, 'ud'); const saves = path.join(root, 'Записи'); const log = path.join(root, 'fake.log');
   fs.mkdirSync(path.join(userData, 'models'), { recursive: true });
-  for (const [name, size] of [['ggml-large-v3-turbo-q5_0.bin', 574041195], ['ggml-small-q5_1.bin', 190085487]]) {
+  for (const [name, size] of [['ggml-large-v3-turbo-q5_0.bin', 574041195], ['ggml-small-q5_1.bin', 190085487], ['ggml-base-q5_1.bin', 59707625]]) {
     const m = path.join(userData, 'models', name); fs.closeSync(fs.openSync(m, 'w')); fs.truncateSync(m, size);
   }
   fs.writeFileSync(path.join(userData, 'settings.json'), JSON.stringify({ customSaveFolderPath: saves, transcribeAfterRecording: false }));
+  // Тестовый звук похож на речь по ритму: полторы секунды сигнала, затем секунда тишины.
+  const speechLike = path.join(root, 'speech-like.wav');
+  require('child_process').execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=300:sample_rate=48000:duration=1.5', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono:d=1', '-filter_complex', '[0:a]aformat=channel_layouts=mono[a];[a][1:a]concat=n=2:v=0:a=1', speechLike]);
   const app = await electron.launch({
     executablePath: path.join(__dirname, '../node_modules/electron/dist/electron'),
-    args: [path.join(__dirname, '..'), '--no-sandbox', '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--disable-gpu'],
+    args: [path.join(__dirname, '..'), '--no-sandbox', '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', `--use-file-for-fake-audio-capture=${speechLike}`, '--disable-gpu'],
     env: { ...process.env, IR_TEST: '1', IR_TEST_SHOW: '1', IR_TEST_USER_DATA: userData, IR_TEST_WHISPER: path.join(__dirname, 'fake-whisper.js'), IR_TEST_WHISPER_SERVER: path.join(__dirname, 'fake-whisper-server.js'), IR_FAKE_LOG: log, IR_TEST_LLM_URL: llm.url },
   });
   const win = await app.firstWindow();
@@ -55,7 +58,7 @@ const fakeLlm = require('./fake-llm');
   await win.click('#record');
   await win.waitForFunction(() => document.getElementById('status').textContent === 'Идёт запись', null, { timeout: 20000 });
   await win.waitForFunction(() => document.getElementById('page-interview').classList.contains('active'));
-  for (let i = 0; i < 60 && !(fs.existsSync(log) && fs.readFileSync(log, 'utf8').includes('inference')); i += 1) await win.waitForTimeout(250);
+  for (let i = 0; i < 80 && !(fs.existsSync(log) && fs.readFileSync(log, 'utf8').split('inference').length > 3); i += 1) await win.waitForTimeout(250);
   console.log('live status:', await win.textContent('#qa-live-status-text'));
   console.log('stt requests:', fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter((l) => l.includes('inference')).slice(0, 2) : 'none');
   await win.waitForTimeout(800);
@@ -83,6 +86,9 @@ const fakeLlm = require('./fake-llm');
   const scrolled = await win.evaluate(() => { const m = document.querySelector('main'); return [m.scrollTop, m.scrollHeight, m.clientHeight]; });
   console.log('scroll', scrolled);
   await win.screenshot({ path: `${shots}/live-cards.png` });
+  // Имитация распознавания весь сценарий повторяет одну и ту же фразу на обеих дорожках.
+  const looped = await win.evaluate(() => [...document.querySelectorAll('.qa-question')].filter((e) => e.textContent.includes('JWT')).length);
+  assert.strictEqual(looped, 1, 'повторы одного вопроса дали несколько карточек');
 
   await win.click('#qa-stop');
   await win.waitForFunction(() => !document.getElementById('qa-summary').hidden, null, { timeout: 15000 });

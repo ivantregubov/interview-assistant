@@ -484,6 +484,19 @@
   .row.stack .field { display: flex; gap: 8px; margin-top: 6px; }
   .row.stack .field .btn { height: 26px; }
 
+
+  /* Проверка звука и что услышано */
+  .qa-heard { font-size: 11px; color: var(--text-2); padding: 0 2px 8px; line-height: 1.35; }
+  .test-meter { padding: 0 12px 10px; }
+  .btn:disabled { opacity: 0.45; }
+  .actions .btn.wide { flex: 1; }
+
+
+  /* Длинные строки без пробелов переносятся, горизонтальной прокрутки нет */
+  main { overflow-x: hidden; }
+  .qa, .qa-head, .qa-question, .qa-hint, .qa-answer, .qa-clarify, .qa-comment, .qa-heard, .banner p { min-width: 0; overflow-wrap: anywhere; }
+  .qa-clarify { line-height: 1.4; color: var(--text-2); -webkit-user-select: text; user-select: text; }
+
   [hidden] { display: none !important; }
 
   @media (prefers-reduced-motion: reduce) {
@@ -567,6 +580,9 @@
         <button class="btn" data-action="transcribeExisting">Расшифровать существующий файл</button>
         <button class="btn" data-action="openRecordingsFolder">Открыть папку</button>
       </div>
+      <div class="actions">
+        <button class="btn wide" id="open-sound-test">Проверить микрофон и наушники</button>
+      </div>
       <div class="actions" id="last-transcript" hidden>
         <button class="btn blue" data-action="openLastTranscript">Открыть последнюю расшифровку</button>
       </div>
@@ -586,9 +602,15 @@
         <p>Чтобы получать подсказки, добавьте API-ключ.</p>
         <button class="btn" id="qa-open-settings">Настройки</button>
       </div>
+      <div class="banner" id="qa-mic-hint" hidden>
+        <p>Слышу ваш голос, но вопросы сейчас берутся только от собеседника. Читаете вопросы сами?</p>
+        <button class="btn" id="qa-mic-source">Да, распознавать</button>
+      </div>
       <div class="banner" id="qa-live-status" hidden><p id="qa-live-status-text"></p></div>
       <div class="banner error" id="coach-error" hidden><p id="coach-error-text"></p></div>
 
+      <div class="qa-heard" id="qa-stt" hidden></div>
+      <div class="qa-heard" id="qa-heard" hidden></div>
       <div class="card qa-summary" id="qa-summary" hidden>
         <h2>Итоги интервью</h2>
         <div class="stats-main">
@@ -612,7 +634,24 @@
     </section>
 
     <section class="page" id="page-settings">
-      <h2 class="section-title" style="margin-top: 4px">Хранение</h2>
+      <h2 class="section-title" style="margin-top: 4px">Проверка звука</h2>
+      <div class="card">
+        <div class="row">
+          <span class="label">Микрофон<span class="sub" id="test-mic-result">Запись на 4 секунды и воспроизведение</span></span>
+          <button class="btn" id="test-mic">Проверить</button>
+        </div>
+        <div class="test-meter"><div class="meter-track"><div class="meter-fill" id="test-mic-level"></div></div></div>
+        <div class="row">
+          <span class="label">Динамики или наушники<span class="sub" id="test-speakers-result">Проверочный сигнал из трёх нот</span></span>
+          <button class="btn" id="test-speakers">Проверить</button>
+        </div>
+        <div class="row" id="test-system-row" hidden>
+          <span class="label">Звук собеседника<span class="sub" id="test-system-result">Слышит ли приложение звук компьютера</span></span>
+          <button class="btn" id="test-system">Проверить</button>
+        </div>
+      </div>
+
+      <h2 class="section-title">Хранение</h2>
       <div class="card">
         <div class="row">
           <span class="label">Папка для записей<span class="path" id="save-path"></span></span>
@@ -659,6 +698,13 @@
               <button data-qsource="both" aria-pressed="false">Собеседник и я</button>
             </span>
           </div>
+          <div class="row" id="live-quality-row" hidden>
+            <span class="label">Распознавание для подсказок<span class="sub">«Быстрее» подходит большинству компьютеров: модель 60 МБ. «Точнее»: 190 МБ, но с большей задержкой</span></span>
+            <span class="pills">
+              <button data-livequality="live" aria-pressed="true">Быстрее</button>
+              <button data-livequality="fast" aria-pressed="false">Точнее</button>
+            </span>
+          </div>
           <div class="row">
             <span class="label">Подключение<span class="sub" id="llm-test-result"></span></span>
             <button class="btn" id="llm-test">Проверить</button>
@@ -685,6 +731,10 @@
 
       <h2 class="section-title">О программе</h2>
       <div class="card">
+        <div class="row" id="diagnostics-row" hidden>
+          <span class="label">Журнал диагностики<span class="sub">Помогает найти причину, если нет расшифровки. Хранится на этом компьютере и содержит распознанный текст</span></span>
+          <button class="btn" id="open-diagnostics">Открыть</button>
+        </div>
         <div class="row"><span class="label">Версия</span><span id="version-detail" style="color: var(--text-2)"></span></div>
       </div>
     </section>
@@ -698,7 +748,7 @@
       <h2 class="section-title">Как пользоваться</h2>
       <div class="card">
         <ol class="steps">
-          <li><span>Выберите экран со звонком и нужный микрофон на вкладке «Запись».</span></li>
+          <li><span>Выберите экран со звонком и нужный микрофон на вкладке «Запись», затем проверьте звук.</span></li>
           <li><span>Наденьте наушники, чтобы реплики не смешивались.</span></li>
           <li><span>Нажмите красную кнопку и убедитесь, что оба индикатора реагируют на звук.</span></li>
           <li><span>В конце нажмите «Остановить». Расшифровка создастся и откроется сама.</span></li>
@@ -711,7 +761,7 @@
         <ol class="steps">
           <li><span>На вкладке «Настройки» выберите сервис и добавьте API-ключ.</span></li>
           <li><span>Начните запись: откроется вкладка «Интервью». Вопросы появятся с подсказкой через пару секунд.</span></li>
-          <li><span>Отвечайте вслух. Правильный ответ получит зелёную галочку.</span></li>
+          <li><span>Отвечайте вслух. Правильный ответ получит зелёную галочку. Каждый вопрос собеседника становится отдельной карточкой, а ваши вопросы к нему показываются как уточнения.</span></li>
           <li><span>После остановки появятся итоги. Они также сохранятся в файл <code>interview-report.md</code>.</span></li>
         </ol>
       </div>
@@ -736,6 +786,7 @@
 
 <script src="coach.js" defer></script>
 <script src="coach-ui.js" defer></script>
+<script src="sound-test.js" defer></script>
 <script>
 (function () {
   "use strict";
@@ -924,6 +975,7 @@
       : "Модель 190 МБ, для слабых компьютеров";
 
     if (window.coachAppState) { window.coachAppState(next); }
+    if (window.soundTestAppState) { window.soundTestAppState(next); }
     byId("version").textContent = "Interview Assistant, версия " + next.version;
     byId("version-detail").textContent = next.version;
   };

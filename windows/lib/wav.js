@@ -63,10 +63,61 @@ function repairWav(filePath, sampleRate = 16000) {
   }
 }
 
+/** Пиковая громкость и длительность дорожки: показывает, попал ли в файл звук. */
+function analyzeWav(filePath) {
+  const { size } = fs.statSync(filePath);
+  const fd = fs.openSync(filePath, 'r');
+  const buffer = Buffer.alloc(1024 * 1024);
+  let position = HEADER_SIZE;
+  let peak = 0;
+  try {
+    for (;;) {
+      const read = fs.readSync(fd, buffer, 0, buffer.length, position);
+      if (read < 2) break;
+      for (let offset = 0; offset + 1 < read; offset += 2) {
+        const value = Math.abs(buffer.readInt16LE(offset));
+        if (value > peak) peak = value;
+      }
+      position += read - (read % 2);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return { seconds: Math.max(0, size - HEADER_SIZE) / 32000, peak: peak / 32768 };
+}
+
+/** Копия дорожки с усилением. Исходная запись не меняется. */
+function writeBoostedWav(source, target, gain) {
+  const input = fs.openSync(source, 'r');
+  const output = fs.openSync(target, 'w');
+  const buffer = Buffer.alloc(1024 * 1024);
+  let position = 0;
+  try {
+    const header = Buffer.alloc(HEADER_SIZE);
+    fs.readSync(input, header, 0, HEADER_SIZE, 0);
+    fs.writeSync(output, header);
+    position = HEADER_SIZE;
+    for (;;) {
+      const read = fs.readSync(input, buffer, 0, buffer.length, position);
+      if (read < 2) break;
+      const usable = read - (read % 2);
+      for (let offset = 0; offset < usable; offset += 2) {
+        const value = Math.round(buffer.readInt16LE(offset) * gain);
+        buffer.writeInt16LE(Math.max(-32768, Math.min(32767, value)), offset);
+      }
+      fs.writeSync(output, buffer, 0, usable);
+      position += usable;
+    }
+  } finally {
+    fs.closeSync(input);
+    fs.closeSync(output);
+  }
+}
+
 function writeWavFile(filePath, samples, sampleRate = 16000) {
   const writer = new WavWriter(filePath, sampleRate);
   writer.append(samples);
   writer.close();
 }
 
-module.exports = { WavWriter, repairWav, writeWavFile };
+module.exports = { WavWriter, repairWav, writeWavFile, analyzeWav, writeBoostedWav };

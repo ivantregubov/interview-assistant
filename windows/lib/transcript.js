@@ -50,9 +50,13 @@ function timestamp(seconds) {
   return `${pad(Math.floor(total / 3600))}:${pad(Math.floor(total / 60) % 60)}:${pad(total % 60)}`;
 }
 
-function markdown(turns, title) {
+function markdown(turns, title, notes = []) {
   const lines = ['# Расшифровка собеседования', '', title, ''];
-  if (turns.length === 0) lines.push('Речь не распознана.');
+  if (turns.length === 0) {
+    lines.push('Речь не распознана.', '');
+    notes.forEach((note) => lines.push(`- ${note}`));
+    if (notes.length) lines.push('');
+  }
   for (const turn of turns) {
     lines.push(`**[${timestamp(turn.start)}] ${SPEAKERS[turn.speaker]}:** ${turn.text}`, '');
   }

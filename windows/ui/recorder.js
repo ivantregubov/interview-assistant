@@ -79,8 +79,9 @@
         audio: {
           deviceId: options.microphoneId ? { exact: options.microphoneId } : undefined,
           echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
+          // Как в приложениях для звонков: тихий микрофон усиливается, шум подавляется.
+          noiseSuppression: true,
+          autoGainControl: true,
         },
       });
 
@@ -179,6 +180,96 @@
     bridge.captureStopped();
   }
 
+  /* Проверка микрофона: запись 4 секунды, затем воспроизведение */
+  window.localMicrophoneTest = async function (microphoneId) {
+    const update = (value) => window.soundTestUpdate(value);
+    let stream = null;
+    let context = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: microphoneId ? { exact: microphoneId } : undefined,
+          echoCancellation: false,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      context = new AudioContext();
+      await context.resume();
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 2048;
+      context.createMediaStreamSource(stream).connect(analyser);
+      const samples = new Float32Array(analyser.fftSize);
+
+      const chunks = [];
+      const recorder = new MediaRecorder(stream);
+      recorder.ondataavailable = (event) => { if (event.data.size) chunks.push(event.data); };
+      const stopped = new Promise((resolve) => { recorder.onstop = resolve; });
+      recorder.start();
+      update({ stage: 'recording' });
+
+      let peak = 0;
+      const timer = setInterval(() => {
+        analyser.getFloatTimeDomainData(samples);
+        let level = 0;
+        for (let index = 0; index < samples.length; index += 1) level = Math.max(level, Math.abs(samples[index]));
+        peak = Math.max(peak, level);
+        update({ level });
+      }, 100);
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+      clearInterval(timer);
+      recorder.stop();
+      await stopped;
+
+      update({ stage: 'playing', level: 0 });
+      const url = URL.createObjectURL(new Blob(chunks, { type: recorder.mimeType }));
+      const audio = new Audio(url);
+      await new Promise((resolve) => {
+        audio.onended = resolve;
+        audio.onerror = resolve;
+        audio.play().catch(resolve);
+        setTimeout(resolve, 5000);
+      });
+      audio.pause();
+      URL.revokeObjectURL(url);
+      update({ stage: 'done', peak });
+    } catch (error) {
+      update({ stage: 'done', error: error.message || String(error), peak: 0 });
+    } finally {
+      stopTracks(stream);
+      if (context) context.close();
+    }
+  };
+
+  /* Проверка захвата звука системы: приложение играет сигнал и само его слушает */
+  window.localSystemAudioTest = async function () {
+    let display = null;
+    let context = null;
+    try {
+      display = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      if (!display.getAudioTracks().length) return { peak: 0 };
+      context = new AudioContext();
+      await context.resume();
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 2048;
+      context.createMediaStreamSource(new MediaStream(display.getAudioTracks())).connect(analyser);
+      const samples = new Float32Array(analyser.fftSize);
+      let peak = 0;
+      const timer = setInterval(() => {
+        analyser.getFloatTimeDomainData(samples);
+        for (let index = 0; index < samples.length; index += 1) peak = Math.max(peak, Math.abs(samples[index]));
+      }, 50);
+      await window.playTestChime();
+      clearInterval(timer);
+      return { peak };
+    } catch (error) {
+      return { error: error.message || String(error), peak: 0 };
+    } finally {
+      stopTracks(display);
+      if (context) context.close();
+    }
+  };
+
   /* Декодирование существующих файлов в 16 кГц, моно */
   async function decodeFile(id, buffer) {
     try {
@@ -204,8 +295,8 @@
 
   window.addEventListener('message', (event) => {
     if (event.source !== window || !event.data || !event.data.coach) return;
-    const { coach, track, text, id, error } = event.data;
-    if (coach === 'speech' && window.coachSpeech) window.coachSpeech(track, text, true);
+    const { coach, track, text, id, error, elapsedMs } = event.data;
+    if (coach === 'speech' && window.coachSpeech) window.coachSpeech(track, text, true, elapsedMs);
     if (coach === 'delta' && window.coachLlmDelta) window.coachLlmDelta(id, text);
     if (coach === 'done' && window.coachLlmDone) window.coachLlmDone(id, error);
   });

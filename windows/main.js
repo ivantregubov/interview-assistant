@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const { WavWriter, repairWav, writeWavFile } = require('./lib/wav');
+const { WavWriter, repairWav, writeWavFile, analyzeWav, writeBoostedWav } = require('./lib/wav');
 const transcript = require('./lib/transcript');
 const whisper = require('./lib/whisper');
 const llm = require('./lib/llm');
@@ -30,6 +30,7 @@ const paths = {
   work: () => path.join(app.getPath('userData'), 'work'),
   liveWork: () => path.join(app.getPath('userData'), 'live-work'),
   keys: () => path.join(app.getPath('userData'), 'api-keys.json'),
+  diagnostics: () => path.join(app.getPath('userData'), 'diagnostics.log'),
   defaultRecordings: () => path.join(app.getPath('videos'), 'Interview Assistant'),
   whisperDir: () => (app.isPackaged
     ? path.join(process.resourcesPath, 'whisper')
@@ -49,6 +50,7 @@ const defaults = {
   llmProvider: 'deepseek',
   llmModels: {},
   questionSource: 'interviewer',
+  liveQuality: 'live',
 };
 let settings = { ...defaults };
 
@@ -67,6 +69,18 @@ function saveSettings() {
 
 function recordingsRoot() {
   return settings.customSaveFolderPath || paths.defaultRecordings();
+}
+
+/* Журнал диагностики. API-ключей в нём нет, но есть распознанный текст, поэтому он остаётся на этом компьютере. */
+function logLine(message) {
+  try {
+    const file = paths.diagnostics();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (fs.existsSync(file) && fs.statSync(file).size > 2 * 1024 * 1024) fs.rmSync(file);
+    fs.appendFileSync(file, `${new Date().toISOString()} ${message}\n`);
+  } catch {
+    // Журнал не должен мешать работе.
+  }
 }
 
 /* API-ключи хранятся в зашифрованном виде средствами Windows */
@@ -128,6 +142,7 @@ const state = {
   lastRecordingFolder: null,
   reportFolder: null,
   liveStatus: '',
+  liveStats: null,
 };
 
 let mainWindow = null;
@@ -177,6 +192,9 @@ function interfaceState() {
     llmModel: llmModel(),
     questionSource: settings.questionSource,
     liveStatus: state.liveStatus,
+    liveStats: state.liveStats,
+    liveQuality: settings.liveQuality,
+    hasDiagnostics: true,
   };
 }
 
@@ -303,6 +321,7 @@ ipcMain.on('capture:started', (_event, info) => {
   state.elapsedSeconds = 0;
   startTime = Date.now();
   lastMicSignal = Date.now();
+  logLine(`Запись начата. Видео: ${info.extension}, звук системы: ${info.hasSystemAudio}, микрофон: ${settings.selectedMicrophoneID}`);
   if (!info.hasSystemAudio) {
     state.errorMessage = 'Звук собеседника не захватывается. Записываются только экран и микрофон.';
   }
@@ -496,16 +515,63 @@ function serverPath() {
   return path.join(paths.whisperDir(), 'whisper-server.exe');
 }
 
-async function startLive() {
-  if (!settings.liveEnabled || !readKeys()[settings.llmProvider]) return;
-  liveGeneration += 1;
-  const generation = liveGeneration;
-  try {
-    // Для живых подсказок важнее скорость, поэтому используем лёгкую модель.
-    const modelPath = await ensureModel('fast', (progress) => {
-      state.liveStatus = `Скачиваю модель для подсказок: ${Math.round(progress * 100)}%. Запись уже идёт.`;
+// Для живых подсказок важнее скорость, поэтому используем лёгкую модель.
+// Она скачивается заранее, иначе на первой записи подсказки появились бы только после загрузки.
+let liveModelDownload = null;
+
+function liveModel() {
+  if (!liveModelDownload) {
+    liveModelDownload = ensureModel(settings.liveQuality, (progress) => {
+      state.liveStatus = `Скачиваю модель для подсказок: ${Math.round(progress * 100)}%.`;
+      pushState();
+    }).finally(() => {
+      liveModelDownload = null;
+      if (state.liveStatus.startsWith('Скачиваю модель')) state.liveStatus = '';
       pushState();
     });
+  }
+  return liveModelDownload;
+}
+
+function prepareLiveModel() {
+  if (settings.liveEnabled && readKeys()[settings.llmProvider]) {
+    liveModel().catch((error) => {
+      logLine(`Модель для подсказок не скачана: ${error.message}`);
+      state.liveStatus = `Модель для подсказок не скачана: ${error.message}`;
+      pushState();
+    });
+  }
+}
+
+/** Заранее открытое соединение с сервисом экономит время первого запроса. */
+let keepAliveTimer = null;
+
+function startKeepAlive() {
+  stopKeepAlive();
+  if (isTest) return;
+  const ping = () => {
+    net.fetch(new URL(llm.PROVIDERS[settings.llmProvider].url).origin, { method: 'HEAD' }).catch(() => {});
+  };
+  ping();
+  keepAliveTimer = setInterval(ping, 20000);
+}
+
+function stopKeepAlive() {
+  clearInterval(keepAliveTimer);
+  keepAliveTimer = null;
+}
+
+async function startLive() {
+  if (!settings.liveEnabled || !readKeys()[settings.llmProvider]) {
+    logLine(`Подсказки выключены: включено ${settings.liveEnabled}, ключ ${Boolean(readKeys()[settings.llmProvider])}`);
+    return;
+  }
+  liveGeneration += 1;
+  const generation = liveGeneration;
+  state.liveStats = { found: { system: 0, mic: 0 }, empty: 0, lastMs: 0, ready: false };
+  startKeepAlive();
+  try {
+    const modelPath = await liveModel();
     if (generation !== liveGeneration) return;
     state.liveStatus = 'Запускаю распознавание речи. Запись уже идёт.';
     pushState();
@@ -513,14 +579,19 @@ async function startLive() {
     const stt = new LiveStt({
       exePath: serverPath(),
       modelPath,
-      vadPath: path.join(paths.whisperDir(), whisper.VAD_MODEL),
       workDir: paths.liveWork(),
       language: settings.transcriptionLanguage,
-      onText: (track, text) => {
-        if (mainWindow) mainWindow.webContents.send('coach:speech', track, text);
+      onText: (track, text, recognitionMs) => {
+        // Время от конца фразы: пауза, по которой определён её конец, плюс распознавание.
+        if (mainWindow) mainWindow.webContents.send('coach:speech', track, text, recognitionMs + 350);
       },
       onError: (message) => {
         state.liveStatus = `Ошибка живого распознавания: ${message}. Запись продолжается.`;
+        pushState();
+      },
+      onLog: logLine,
+      onStats: (stats) => {
+        state.liveStats = { ...stats, ready: true };
         pushState();
       },
     });
@@ -531,7 +602,9 @@ async function startLive() {
       return;
     }
     state.liveStatus = '';
+    state.liveStats = { ...state.liveStats, ready: true };
   } catch (error) {
+    logLine(`Подсказки недоступны: ${error.message}`);
     state.liveStatus = `Подсказки недоступны: ${error.message}. Запись продолжается.`;
     if (liveStt) liveStt.stop();
     liveStt = null;
@@ -540,10 +613,12 @@ async function startLive() {
 }
 
 function stopLive() {
+  stopKeepAlive();
   liveGeneration += 1;
   if (liveStt) liveStt.stop();
   liveStt = null;
   state.liveStatus = '';
+  state.liveStats = null;
 }
 
 async function runLlm(request) {
@@ -554,7 +629,7 @@ async function runLlm(request) {
   try {
     const apiKey = loadApiKey(provider);
     if (!apiKey) throw new Error('API-ключ не добавлен или не читается, сохраните его заново');
-    await llm.streamChat({
+    const options = {
       fetchImpl: net.fetch,
       url: isTest ? process.env.IR_TEST_LLM_URL : undefined,
       provider,
@@ -562,10 +637,22 @@ async function runLlm(request) {
       apiKey,
       messages: request.messages,
       maxTokens: request.maxTokens,
+      idleTimeoutMs: isTest && process.env.IR_TEST_LLM_TIMEOUT ? Number(process.env.IR_TEST_LLM_TIMEOUT) : undefined,
       onText: (text) => reply('coach:llmDelta', request.id, text),
-    });
+    };
+    let result;
+    try {
+      result = await llm.streamChat(options);
+    } catch (error) {
+      // Зависший запрос повторяем один раз, если ответ ещё не начал приходить.
+      if (!error.isTimeout || error.textLength) throw error;
+      logLine(`Запрос ${request.id}: сервис не ответил, повторяю`);
+      result = await llm.streamChat(options);
+    }
+    logLine(`Запрос ${request.id}: первый ответ через ${result.firstByteMs} мс, всего ${result.totalMs} мс, символов ${result.textLength}`);
     reply('coach:llmDone', request.id, null);
   } catch (error) {
+    logLine(`Запрос ${request.id}: ошибка: ${error.message}`);
     reply('coach:llmDone', request.id, error.message);
   }
 }
@@ -585,24 +672,70 @@ function exePath() {
   return path.join(paths.whisperDir(), 'whisper-cli.exe');
 }
 
-function runWhisper(modelPath, wavPath, speaker, from, to) {
+function decibels(peak) {
+  return peak > 0 ? `${Math.round(20 * Math.log10(peak))} дБ` : 'тишина';
+}
+
+/** Возвращает фразы и пояснение, если речи в дорожке не нашлось. */
+async function runWhisper(modelPath, wavPath, speaker, from, to, label) {
   repairWav(wavPath);
-  state.transcriptionStage = 'recognize';
-  state.transcriptionProgress = from;
-  pushState();
-  return whisper.transcribeWav({
-    exePath: exePath(),
-    vadPath: path.join(paths.whisperDir(), whisper.VAD_MODEL),
-    modelPath,
-    wavPath,
-    workDir: paths.work(),
-    language: settings.transcriptionLanguage,
-    speaker,
-    onProgress: (progress) => {
-      state.transcriptionProgress = from + progress * (to - from);
-      pushState();
-    },
-  });
+  const audio = analyzeWav(wavPath);
+  logLine(`${label}: ${audio.seconds.toFixed(1)} с, пик ${decibels(audio.peak)}`);
+
+  // Тишину незачем распознавать: важнее сразу сообщить, что звук не записался.
+  if (audio.peak < 0.002) {
+    return { segments: [], note: `${label}: в записи нет звука (${decibels(audio.peak)}, ${Math.round(audio.seconds)} с). Проверьте устройство на вкладке «Настройки», раздел «Проверка звука».` };
+  }
+
+  // Тихую дорожку распознаём по усиленной копии: так фильтр речи и Whisper работают заметно надёжнее.
+  let input = wavPath;
+  const boosted = `${paths.work()}-boosted.wav`;
+  if (audio.peak < 0.3) {
+    const gain = Math.min(0.7 / audio.peak, 30);
+    logLine(`${label}: тихая дорожка, усиление в ${gain.toFixed(1)} раза`);
+    fs.mkdirSync(path.dirname(boosted), { recursive: true });
+    writeBoostedWav(wavPath, boosted, gain);
+    input = boosted;
+  }
+
+  const recognize = (useVad, start, end) => {
+    state.transcriptionStage = 'recognize';
+    state.transcriptionProgress = start;
+    pushState();
+    return whisper.transcribeWav({
+      exePath: exePath(),
+      vadPath: path.join(paths.whisperDir(), whisper.VAD_MODEL),
+      modelPath,
+      wavPath: input,
+      workDir: paths.work(),
+      language: settings.transcriptionLanguage,
+      speaker,
+      useVad,
+      onLog: logLine,
+      onProgress: (progress) => {
+        state.transcriptionProgress = start + progress * (end - start);
+        pushState();
+      },
+    });
+  };
+
+  const middle = (from + to) / 2;
+  let segments;
+  try {
+    segments = await recognize(true, from, middle);
+    if (segments.length === 0) {
+      // Звук есть, а фильтр речи ничего не нашёл: проверяем дорожку целиком.
+      logLine(`${label}: фильтр речи ничего не нашёл, повторяю без него`);
+      segments = await recognize(false, middle, to);
+    }
+  } finally {
+    fs.rmSync(boosted, { force: true });
+  }
+  logLine(`${label}: распознано фраз ${segments.length}`);
+  return {
+    segments,
+    note: segments.length ? '' : `${label}: звук есть (пик ${decibels(audio.peak)}), но речь в нём не найдена.`,
+  };
 }
 
 async function transcribeRecording(folder) {
@@ -612,12 +745,13 @@ async function transcribeRecording(folder) {
     throw new Error('В папке нет файлов mic.wav и system.wav.');
   }
   const modelPath = await ensureModel();
-  const mic = await runWhisper(modelPath, micPath, 'me', 0, 0.5);
-  const system = await runWhisper(modelPath, systemPath, 'interviewer', 0.5, 1);
+  const mic = await runWhisper(modelPath, micPath, 'me', 0, 0.5, 'Ваш голос');
+  const system = await runWhisper(modelPath, systemPath, 'interviewer', 0.5, 1, 'Собеседник');
 
-  const turns = transcript.buildDialogue(mic, system);
+  const turns = transcript.buildDialogue(mic.segments, system.segments);
   const target = path.join(folder, 'transcript.md');
-  fs.writeFileSync(target, transcript.markdown(turns, `Запись: ${path.basename(folder)}`));
+  const notes = [mic.note, system.note].filter(Boolean);
+  fs.writeFileSync(target, transcript.markdown(turns, `Запись: ${path.basename(folder)}`, notes));
   fs.writeFileSync(path.join(folder, 'transcript.json'), transcript.json(turns));
   return target;
 }
@@ -659,18 +793,19 @@ async function transcribeFile(filePath) {
   const samples = await decodeInWindow(filePath);
   fs.mkdirSync(path.dirname(paths.work()), { recursive: true });
   const temporary = `${paths.work()}-decoded.wav`;
-  let segments;
+  let result;
   try {
     writeWavFile(temporary, samples);
-    segments = await runWhisper(modelPath, temporary, 'unknown', 0, 1);
+    result = await runWhisper(modelPath, temporary, 'unknown', 0, 1, 'Файл');
   } finally {
     fs.rmSync(temporary, { force: true });
   }
 
   const base = path.join(path.dirname(filePath), `${path.parse(filePath).name}.transcript`);
   const target = `${base}.md`;
-  fs.writeFileSync(target, transcript.markdown(segments, `Файл: ${path.basename(filePath)}`));
-  fs.writeFileSync(`${base}.json`, transcript.json(segments));
+  const notes = result.note ? [result.note] : [];
+  fs.writeFileSync(target, transcript.markdown(result.segments, `Файл: ${path.basename(filePath)}`, notes));
+  fs.writeFileSync(`${base}.json`, transcript.json(result.segments));
   return target;
 }
 
@@ -698,6 +833,7 @@ async function processQueue() {
     }
   } catch (error) {
     if (!isQuitting) {
+      logLine(`Ошибка расшифровки: ${error.message}`);
       state.transcriptionError = `Не удалось расшифровать: ${error.message} `
         + 'Исходные файлы сохранены, расшифровку можно повторить.';
     }
@@ -788,7 +924,18 @@ const actions = {
   openRecordingsFolder,
   openLastTranscript: openTranscript,
   openMicrophoneSettings() { shell.openExternal('ms-settings:privacy-microphone'); },
-  setLiveEnabled(value) { settings.liveEnabled = Boolean(value); saveSettings(); },
+  setLiveQuality(value) {
+    if (value === 'live' || value === 'fast') {
+      settings.liveQuality = value;
+      saveSettings();
+      prepareLiveModel();
+    }
+  },
+  setLiveEnabled(value) {
+    settings.liveEnabled = Boolean(value);
+    saveSettings();
+    prepareLiveModel();
+  },
   setLlmProvider(value) {
     if (llm.PROVIDERS[value]) { settings.llmProvider = value; saveSettings(); }
   },
@@ -802,12 +949,19 @@ const actions = {
   saveApiKey(value) {
     try {
       saveApiKey(settings.llmProvider, String(value));
+      prepareLiveModel();
     } catch (error) {
       state.errorMessage = `Не удалось сохранить ключ: ${error.message}`;
     }
   },
   deleteApiKey() { saveApiKey(settings.llmProvider, ''); },
   syncState() {},
+  liveLog(value) { logLine(`Подсказки: ${value}`); },
+  openDiagnostics() {
+    fs.mkdirSync(path.dirname(paths.diagnostics()), { recursive: true });
+    if (!fs.existsSync(paths.diagnostics())) fs.writeFileSync(paths.diagnostics(), '');
+    shell.openPath(paths.diagnostics());
+  },
   llmRequest: runLlm,
   saveReport,
 };
@@ -936,6 +1090,7 @@ app.whenReady().then(() => {
 
   createWindow();
   createTray();
+  if (!isTest) prepareLiveModel();
   screen.on('display-added', loadDisplays);
   screen.on('display-removed', loadDisplays);
   screen.on('display-metrics-changed', loadDisplays);

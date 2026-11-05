@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import Foundation
 import WebKit
@@ -10,6 +11,7 @@ final class WebBridge: NSObject, WKScriptMessageHandler {
     private var webView: WKWebView?
     private var isPageReady = false
     private var subscriptions: [AnyCancellable] = []
+    private var microphoneTester: MicrophoneTester?
 
     init(model: RecorderModel) {
         self.model = model
@@ -104,6 +106,8 @@ final class WebBridge: NSObject, WKScriptMessageHandler {
             model.relaunch()
         case "syncState":
             pushState()
+        case "testMicrophone":
+            testMicrophone()
         case "setLiveEnabled":
             if let enabled = value as? Bool {
                 model.liveEnabled = enabled
@@ -142,6 +146,18 @@ final class WebBridge: NSObject, WKScriptMessageHandler {
         default:
             break
         }
+    }
+
+    private func testMicrophone() {
+        guard let device = AVCaptureDevice(uniqueID: model.selectedMicrophoneID) else {
+            callPage("soundTestUpdate", [["stage": "done", "error": "микрофон не найден", "peak": 0]])
+            return
+        }
+        let tester = MicrophoneTester { [weak self] update in
+            Task { @MainActor in self?.callPage("soundTestUpdate", [update]) }
+        }
+        microphoneTester = tester
+        tester.run(device: device)
     }
 
     private func runLlm(id: Int, messages: [[String: Any]], maxTokens: Int) {

@@ -18,9 +18,12 @@
     },
     onChange: render,
     onError: showError,
+    log(message) {
+      send('liveLog', message);
+    },
   });
 
-  window.coachSpeech = (track, text, isFinal) => coach.speech(track, text, isFinal);
+  window.coachSpeech = (track, text, isFinal, elapsedMs) => coach.speech(track, text, isFinal, elapsedMs);
   window.coachLlmDelta = (id, text) => coach.llmDelta(id, text);
   window.coachLlmDone = (id, error) => coach.llmDone(id, error);
 
@@ -43,7 +46,11 @@
         <span class="qa-mark" role="img"></span>
       </div>
       <p class="qa-hint"></p>
-      <div class="qa-answer-block" hidden>
+      <div class="qa-answer-block qa-clarify-block" hidden>
+        <div class="qa-label">Вы уточнили</div>
+        <p class="qa-clarify"></p>
+      </div>
+      <div class="qa-answer-block qa-main-answer" hidden>
         <div class="qa-label">Ваш ответ</div>
         <p class="qa-answer"></p>
       </div>
@@ -65,7 +72,10 @@
     hint.classList.toggle('waiting', !card.hint);
     hint.hidden = card.hintDone && !card.hint;
 
-    element.querySelector('.qa-answer-block').hidden = !card.answer;
+    const clarifications = card.clarifications || [];
+    element.querySelector('.qa-clarify-block').hidden = clarifications.length === 0;
+    element.querySelector('.qa-clarify').textContent = clarifications.join(' ');
+    element.querySelector('.qa-main-answer').hidden = !card.answer;
     element.querySelector('.qa-answer').textContent = card.answer;
 
     const comment = element.querySelector('.qa-comment');
@@ -88,6 +98,15 @@
     const list = byId('qa-list');
     const finished = snapshot.phase === 'finished';
 
+    // Предварительно показанная фраза могла оказаться не вопросом.
+    const present = new Set(snapshot.cards.map((card) => card.id));
+    cardElements.forEach((element, id) => {
+      if (!present.has(id)) {
+        element.remove();
+        cardElements.delete(id);
+      }
+    });
+
     snapshot.cards.forEach((card) => {
       let element = cardElements.get(card.id);
       if (!element) {
@@ -105,6 +124,27 @@
     const interimBar = byId('qa-interim');
     interimBar.hidden = !interim;
     interimBar.textContent = interim;
+
+    const live = snapshot.phase === 'live';
+    const heardBar = byId('qa-heard');
+    heardBar.hidden = !live;
+    if (live) {
+      const last = snapshot.lastHeard
+        ? ` Последнее: «${snapshot.lastHeard.text}»`
+        : ' Пока ничего не слышно.';
+      const decision = {
+        none: ' Вопроса в ней нет.',
+        same: ' Это продолжение вопроса.',
+        question: ' Это вопрос.',
+      }[snapshot.lastDecision] || '';
+      const seconds = (ms) => `${(ms / 1000).toFixed(1).replace('.', ',')} с`;
+      const delay = snapshot.lastLatency && snapshot.lastLatency.question !== undefined
+        ? ` Задержка от конца фразы: вопрос ${seconds(snapshot.lastLatency.question)}`
+          + (snapshot.lastLatency.hint !== undefined ? `, подсказка ${seconds(snapshot.lastLatency.hint)}.` : '.')
+        : '';
+      heardBar.textContent = `Распознано фраз: собеседник ${snapshot.heard.system}, вы ${snapshot.heard.mic}.${last}${decision}${delay}`;
+    }
+    byId('qa-mic-hint').hidden = !(live && snapshot.micIgnored);
 
     const summary = byId('qa-summary');
     summary.hidden = !finished;
@@ -150,6 +190,18 @@
       coach.stop();
     }
     previousState = next.state;
+    coach.setQuestionSource(next.questionSource);
+
+    const stats = next.liveStats;
+    const sttRow = byId('qa-stt');
+    sttRow.hidden = !(recording && stats);
+    if (recording && stats) {
+      sttRow.textContent = stats.ready
+        ? `Фраз найдено в звуке: собеседник ${stats.found.system}, вы ${stats.found.mic}. Без текста: ${stats.empty}.`
+          + (stats.lastMs ? ` Распознавание: ${(stats.lastMs / 1000).toFixed(1)} с.` : '')
+          + (stats.dropped ? ` Пропущено из-за нагрузки: ${stats.dropped}.` : '')
+        : 'Загружаю распознавание речи.';
+    }
 
     byId('qa-timer').textContent = next.elapsedText;
     byId('qa-empty').textContent = recording
@@ -173,6 +225,10 @@
     document.querySelectorAll('[data-qsource]').forEach((button) => {
       button.setAttribute('aria-pressed', String(button.dataset.qsource === next.questionSource));
     });
+    byId('live-quality-row').hidden = !next.liveQuality;
+    document.querySelectorAll('[data-livequality]').forEach((button) => {
+      button.setAttribute('aria-pressed', String(button.dataset.livequality === next.liveQuality));
+    });
     const model = byId('llm-model');
     if (document.activeElement !== model) model.value = next.llmModel;
     byId('llm-key-status').textContent = next.llmHasKey ? 'Ключ сохранён на этом компьютере' : 'Ключ не добавлен';
@@ -191,6 +247,9 @@
   });
   document.querySelectorAll('[data-qsource]').forEach((button) => {
     button.addEventListener('click', () => send('setQuestionSource', button.dataset.qsource));
+  });
+  document.querySelectorAll('[data-livequality]').forEach((button) => {
+    button.addEventListener('click', () => send('setLiveQuality', button.dataset.livequality));
   });
   byId('llm-model').addEventListener('change', (event) => send('setLlmModel', event.target.value.trim()));
   byId('llm-key-save').addEventListener('click', () => {
@@ -215,6 +274,8 @@
       result.className = `sub status-pill ${error ? 'bad' : 'ok'}`;
     });
   });
+  byId('qa-mic-source').addEventListener('click', () => send('setQuestionSource', 'both'));
+  byId('open-diagnostics').addEventListener('click', () => send('openDiagnostics'));
   byId('qa-open-settings').addEventListener('click', () => {
     document.querySelector('[data-tab="settings"]').click();
   });

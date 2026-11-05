@@ -9,6 +9,7 @@ const MODEL_BASE = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/';
 const MODELS = {
   accurate: { file: 'ggml-large-v3-turbo-q5_0.bin', size: 574041195 },
   fast: { file: 'ggml-small-q5_1.bin', size: 190085487 },
+  live: { file: 'ggml-base-q5_1.bin', size: 59707625 },
 };
 const VAD_MODEL = 'ggml-silero-v5.1.2.bin';
 const VC_REDIST_URL = 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
@@ -42,14 +43,21 @@ function linkOrCopy(source, target) {
 
 /** Служебные пометки Whisper вроде [BLANK_AUDIO] или (музыка) не являются речью. */
 function isSpeech(text) {
-  return text.length > 0 && !/^[\[(（♪*].*[\])）♪*]$/su.test(text);
+  if (text.length === 0 || /^[\[(（♪*].*[\])）♪*]$/su.test(text)) return false;
+  // На тишине и шуме Whisper часто выдаёт такие фразы из субтитров, настоящей речью они не являются.
+  return !/^(субтитры (сделал|создавал|подготовил)|редактор субтитров|корректор|продолжение следует|спасибо за просмотр|подписывайтесь на канал)/iu.test(text);
+}
+
+/** Длинные повторы одного символа: на шуме Whisper иногда зацикливается. */
+function cleanText(text) {
+  return text.replace(/(.)\1{4,}/gu, '$1').replace(/\s+/g, ' ').trim();
 }
 
 function parseSegments(raw, speaker) {
   const data = JSON.parse(raw);
   const segments = [];
   for (const item of data.transcription || []) {
-    const text = String(item.text || '').trim();
+    const text = cleanText(String(item.text || ''));
     if (!isSpeech(text)) continue;
     segments.push({
       start: item.offsets.from / 1000,
@@ -66,7 +74,7 @@ function parseSegments(raw, speaker) {
  * Все пути передаются относительно рабочей папки: так кириллица в имени пользователя
  * или в папке записи не попадает в аргументы консольной программы.
  */
-function transcribeWav({ exePath, vadPath, modelPath, wavPath, workDir, language, speaker, onProgress }) {
+function transcribeWav({ exePath, vadPath, modelPath, wavPath, workDir, language, speaker, useVad = true, onLog = () => {}, onProgress }) {
   if (missingRuntime()) {
     return Promise.reject(new Error(
       `В Windows не установлен пакет Microsoft Visual C++ Redistributable. Скачайте его: ${VC_REDIST_URL}`
@@ -76,7 +84,7 @@ function transcribeWav({ exePath, vadPath, modelPath, wavPath, workDir, language
   fs.rmSync(workDir, { recursive: true, force: true });
   fs.mkdirSync(workDir, { recursive: true });
   linkOrCopy(modelPath, path.join(workDir, 'model.bin'));
-  linkOrCopy(vadPath, path.join(workDir, 'vad.bin'));
+  if (useVad) linkOrCopy(vadPath, path.join(workDir, 'vad.bin'));
   linkOrCopy(wavPath, path.join(workDir, 'input.wav'));
 
   const threads = Math.max(2, Math.min(8, Math.floor(os.cpus().length * 0.75)));
@@ -88,8 +96,7 @@ function transcribeWav({ exePath, vadPath, modelPath, wavPath, workDir, language
     '--output-json',
     '--output-file', 'output',
     '--print-progress',
-    '--vad',
-    '--vad-model', 'vad.bin',
+    ...(useVad ? ['--vad', '--vad-model', 'vad.bin'] : []),
   ];
 
   return new Promise((resolve, reject) => {
@@ -115,6 +122,7 @@ function transcribeWav({ exePath, vadPath, modelPath, wavPath, workDir, language
 
     child.on('close', (code) => {
       activeChild = null;
+      onLog(`whisper-cli завершился с кодом ${code}, VAD: ${useVad}. Конец вывода:\n${log.slice(-1500)}`);
       try {
         if (code === EXIT_DLL_NOT_FOUND) {
           throw new Error(`Не хватает компонентов Windows. Установите Microsoft Visual C++ Redistributable: ${VC_REDIST_URL}`);
@@ -136,4 +144,4 @@ function transcribeWav({ exePath, vadPath, modelPath, wavPath, workDir, language
   });
 }
 
-module.exports = { MODELS, MODEL_BASE, VAD_MODEL, transcribeWav, parseSegments, isSpeech, cancelActive };
+module.exports = { MODELS, MODEL_BASE, VAD_MODEL, VC_REDIST_URL, EXIT_DLL_NOT_FOUND, missingRuntime, transcribeWav, parseSegments, isSpeech, cancelActive };

@@ -1,7 +1,7 @@
 {
   "name": "interview-assistant",
   "productName": "Interview Assistant",
-  "version": "1.2.0",
+  "version": "1.2.6",
   "description": "Запись собеседований с автоматической расшифровкой",
   "author": "Ivan Tregubov",
   "license": "UNLICENSED",

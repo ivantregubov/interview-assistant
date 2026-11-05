@@ -62,9 +62,21 @@ function createSseParser(onText) {
   };
 }
 
-async function streamChat({ fetchImpl, url, provider, model, apiKey, messages, maxTokens, onText, timeoutMs = 30000 }) {
+/**
+ * Таймаут считается от последней активности сервиса, а не от начала запроса:
+ * длинный ответ не обрывается, а зависший запрос быстро освобождает очередь подсказок.
+ */
+async function streamChat({ fetchImpl, url, provider, model, apiKey, messages, maxTokens, onText, idleTimeoutMs = 12000 }) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const started = Date.now();
+  let firstByteMs = null;
+  let textLength = 0;
+  let timer = null;
+  const touch = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), idleTimeoutMs);
+  };
+  touch();
   try {
     const response = await fetchImpl(url || PROVIDERS[provider].url, {
       method: 'POST',
@@ -79,17 +91,29 @@ async function streamChat({ fetchImpl, url, provider, model, apiKey, messages, m
     if (!response.ok) {
       throw new Error(httpError(response.status, await response.text()));
     }
-    const parse = createSseParser(onText);
+    const parse = createSseParser((text) => {
+      textLength += text.length;
+      onText(text);
+    });
     const decoder = new TextDecoder();
     const reader = response.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (firstByteMs === null) firstByteMs = Date.now() - started;
+      touch();
       parse(decoder.decode(value, { stream: true }));
     }
     parse('\n');
+    return { firstByteMs, totalMs: Date.now() - started, textLength };
   } catch (error) {
-    if (error.name === 'AbortError') throw new Error('сервис не ответил вовремя');
+    if (error.name === 'AbortError' || controller.signal.aborted) {
+      const timeout = new Error('сервис не ответил вовремя');
+      timeout.isTimeout = true;
+      timeout.textLength = textLength;
+      throw timeout;
+    }
+    error.textLength = textLength;
     throw error;
   } finally {
     clearTimeout(timer);
